@@ -11,6 +11,9 @@ use Path::Class;
 
 use constant AUTH => glob '~/.google.json';
 
+use constant SPREADSHEET => 'Possible CCCC Kids';
+use constant ROLE_SHEET  => 'Sheet1';
+
 my @DAY = qw( monday tuesday wednesday thursday friday );
 
 my %DAY = map { $DAY[$_] => $_ + 1 } 0 .. $#DAY;
@@ -19,136 +22,208 @@ my $auth = JSON->new->decode( scalar file(AUTH)->slurp );
 
 my $service = Net::Google::Spreadsheets->new(%$auth);
 
-my $sheet = $service->spreadsheet( { title => 'Possible CCCC Kids' } );
-my $work   = $sheet->worksheet( { title => 'Sheet1' } );
-my @cohort = ();
-my %places = ();
+my $sheet = $service->spreadsheet( { title => SPREADSHEET } );
+my $work = $sheet->worksheet( { title => ROLE_SHEET } );
+
+my @cohort    = ();
+my %applicant = ();
+my %places    = ();
+
 for my $kid ( map { $_->content } $work->rows ) {
+  #  print JSON->new->pretty->canonical->encode($kid);
   my %rec = %$kid;
   for my $k ( keys %rec ) {
     next unless $k =~ /^schedule(.+)/;
     my $sn = $1;
     if ( $rec{id} eq 'PLACES' ) {
-      $places{$sn} = $rec{$k};
+      $places{$sn} = $rec{$k} + 0;
     }
     elsif ( $rec{id} eq 'TOTAL' ) {
     }
     else {
-      $rec{$k} = make_srec( $rec{$k} );
+      for my $sl ( mk_slot( $rec{$k} ) ) {
+        push @{ $applicant{$sn} }, { rule => $sl, kid => \%rec };
+      }
     }
   }
   push @cohort, \%rec;
 }
 
-# Build sessions
+#print JSON->new->pretty->canonical->encode( \%places );
+#print JSON->new->pretty->canonical->encode( \%applicant );
+
+# Populate all the sessions with all the kids that might be eligible for
+# them
 my @session = ();
 for my $day (@DAY) {
-  for my $sn ( sort keys %places ) {
-    push @session,
-     {name     => "$day-$sn",
-      alloc    => [],
-      day      => $DAY{$day},
-      places   => $places{$sn},
-      key      => "schedule$sn",
-      complete => 0,
-     };
+  my $dn = $DAY{$day};
+  for my $sn ( keys %places ) {
+    my @role = ();
+    for my $cand ( @{ $applicant{$sn} } ) {
+      my $rule = $cand->{rule};
+      push @role, $cand
+       if $rule->{days} > 0 && $rule->{from}[$dn];
+    }
+    push @session, { day => $dn, session => $sn, role => \@role };
   }
 }
-
-print JSON->new->pretty->canonical->encode( \@cohort );
 
 while () {
-
+  # Sort by fullness
   @session = sort {
-    $a->{complete} <=> $b->{complete}
-     || @{ $a->{alloc} } / $a->{places} <=> @{ $b->{alloc} } / $b->{places}
+    ( @{ $a->{role} } / $places{ $a->{session} } )
+     <=> ( @{ $b->{role} } / $places{ $b->{session} } )
   } @session;
 
-  my $sess = $session[0];    # least filled
-  last if $sess->{complete};                        # can't continue
-  last if @{ $sess->{alloc} } = $sess->{places};    # all full
+  my $work = $session[-1];
 
-  my $key = $sess->{key};
+  # All within quota?
+  last if @{ $work->{role} } <= $places{ $work->{session} };
+
+  # Sort by flexibility
+  @{ $work->{role} }
+   = sort { $a->{rule}{flexibility} <=> $b->{rule}{flexibility} }
+   @{ $work->{role} };
+
+  my $app = $work->{role}[-1];
+
+  last if $app->{rule}{flexibility} <= 1;    # no wiggle
+
+  # Remove from day
+  pop @{ $work->{role} };
+  my $rule = $app->{rule};
+  $rule->{from}[$work->{day}] = 0;
+  $rule->{flexibility} = count( $rule->{from} ) / $rule->{days};
+
+  print "Removed $app->{kid}{id} from $work->{day} / $work->{session}\n";
+}
+
+report( \@session );
+
+# Now back annotate the kids with which slots they got
+for my $sess (@session) {
   my $day = $sess->{day};
-
-  my $kid = get_kid( $key, $day, @cohort );
-  if ($kid) {
-    print "Allocating $kid->{who} to $sess->{name}\n";
-    push @{ $sess->{alloc} }, $kid;
-  }
-  else {
-    print "No more candidates for $sess->{name}\n";
-    $sess->{complete} = 1;
+  my $sn  = $sess->{session};
+  for my $app ( @{ $sess->{role} } ) {
+    $app->{kid}{timetable}{$sn}{$day}++;
   }
 }
 
-sub get_kid {
-  my ( $key, $day, @cohort ) = @_;
+my @sn = sort keys %places;
+my @hdr = ( 'id', 'who' );
+for my $sn (@sn) {
+  push @hdr, "$sn (wanted)", "$sn (available)";
+}
+my @rep = ( [@hdr] );
+for my $kid (@cohort) {
+  my $row = [$kid->{id}, $kid->{who}];
+  for my $sn (@sn) {
+    push @$row, $kid->{"schedule$sn"}, as_days( $kid->{timetable}{$sn} );
+  }
+  push @rep, $row;
+}
 
-  for my $kid (@cohort) {
-    my $srec = $kid->{$key};
-    if ( 'ARRAY' eq $srec->{slot} ) {
-      if ( $srec->{slot}{$day} ) {
-        $srec->{slot}{$day} = 0;
-        $srec->{got}++;
-        return $kid;
-      }
+my $fmt = format_for( \@rep );
+for my $row (@rep) {
+  printf "$fmt\n", @$row;
+}
+
+#print JSON->new->pretty->canonical->encode( \@cohort );
+
+sub format_for {
+  my $rep = shift;
+  my @w   = ();
+  for my $row (@$rep) {
+    for my $i ( 0 .. $#$row ) {
+      my $len = length $row->[$i];
+      $w[$i] = $len unless defined $w[$i] && $w[$i] > $len;
     }
-    else {
-      if ( $srec->{slot} > 0 ) {
-        $srec->{slot}--;
-        $srec->{got}++;
-        return $kid;
-      }
+  }
+  return join ' | ', map "%-${_}s", @w;
+}
+
+sub as_days {
+  my $h = shift;
+  return join ', ',
+   map { substr $DAY[$_ - 1], 0, 3 } sort { $a <=> $b } keys %$h;
+}
+
+sub report {
+  my $session = shift;
+  my %idx     = ();
+  $idx{ $_->{day} }{ $_->{session} } = $_ for @$session;
+  for my $dn ( sort { $a <=> $b } keys %idx ) {
+    my $day = $idx{$dn};
+    for my $sn ( sort keys %$day ) {
+      my $sess = $day->{$sn};
+      my $role = $sess->{role};
+      print $DAY[$dn - 1], '-', $sn, ': ',
+       scalar(@$role), '/', $places{$sn}, ' [',
+       join( ', ', map { $_->{kid}{id} } @$role ), "]\n";
+    }
+  }
+}
+
+sub can_bind {
+  my ( $kid, $sn, $day ) = @_;
+
+  if ( my $slot = $kid->{slots}{$sn} ) {
+    for my $sl (@$slot) {
+      return count( $sl->{from} ) / $sl->{days}
+       if $sl->{days} > 0 && $sl->{from}[$day];
     }
   }
 
   return;
 }
 
-sub make_srec {
-  my $v    = shift;
-  my $slot = parse_slot($v);
-  return {
-    want        => want($slot),
-    got         => 0,
-    slot        => $slot,
-    flexibility => 'ARRAY' eq ref $slot ? 0 : 1,
-  };
+sub count {
+  my $ar  = shift;
+  my $tot = 0;
+  for (@$ar) { $tot++ if $_ }
+  return $tot;
 }
 
-sub want {
-  my $slot = shift;
-  return $slot unless 'ARRAY' eq ref $slot;
-  my $tot = 0;
-  for (@$slot) { $tot++ if $_ }
-  return $tot;
+sub mk_slot {
+  my @sl = parse_slot(shift);
+  $_->{flexibility} = count( $_->{from} ) / $_->{days} for @sl;
+  return @sl;
 }
 
 sub parse_slot {
   my $v = shift;
   $v =~ s/\s+//g;
-  return 0 if $v eq '';
-  return $v + 0 if $v =~ /^[1-5]$/;
+  return if $v eq '';
+  # Special case a simple number as N days
+  return ( { days => $v + 0, from => [0, 1, 1, 1, 1, 1, 0] } )
+   if $v =~ /^[1-5]$/;
   return parse_range($v);
   die "Can't parse $v\n";
 }
 
 sub parse_range {
-  my $v = shift;
-  my $slot = [0, 0, 0, 0, 0, 0, 0];
+  my $v    = shift;
+  my @slot = ();
   for my $rr ( split /,/, $v ) {
+    my $sl = { days => 0, from => [0, 0, 0, 0, 0, 0, 0] };
     if ( $rr =~ /^([\w\d]+)-([\w\d]+)$/ ) {
-      $slot->[$_] = 1 for ( day_num($1) .. day_num($2) );
+      my $from = day_num($1);
+      my $to   = day_num($2);
+      die "Days in range out of order" unless $from < $to;
+      $sl->{days} = $to - $from + 1;
+      $sl->{from}[$_] = 1 for $from .. $to;
     }
-    elsif ( $rr =~ /^([\w\d]+)$/ ) {
-      $slot->[day_num($1)] = 1;
+    elsif ( $rr =~ /^[\w\d]+(?:\/[\w\d]+)*$/ ) {
+      my @alt = map { day_num($_) } split /\//, $rr;
+      $sl->{days} = 1;
+      $sl->{from}[$_] = 1 for @alt;
     }
     else {
       die "Can't parse slot: $rr\n";
     }
+    push @slot, $sl;
   }
-  return $slot;
+  return @slot;
 }
 
 sub day_num {
