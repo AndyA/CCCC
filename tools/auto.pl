@@ -49,8 +49,7 @@ for my $kid ( map { $_->content } $work->rows ) {
   push @cohort, \%rec;
 }
 
-#print JSON->new->pretty->canonical->encode( \%places );
-#print JSON->new->pretty->canonical->encode( \%applicant );
+die "No PLACES line found" unless keys %places;
 
 # Populate all the sessions with all the kids that might be eligible for
 # them
@@ -67,6 +66,8 @@ for my $day (@DAY) {
     push @session, { day => $dn, session => $sn, role => \@role };
   }
 }
+
+#print JSON->new->pretty->canonical->encode( \@session );
 
 while () {
   # Sort by fullness
@@ -95,7 +96,7 @@ while () {
   $rule->{from}[$work->{day}] = 0;
   $rule->{flexibility} = count( $rule->{from} ) / $rule->{days};
 
-  print "Removed $app->{kid}{id} from $work->{day} / $work->{session}\n";
+#  print "Removed $app->{kid}{id} from $work->{day} / $work->{session}\n";
 }
 
 report( \@session );
@@ -158,7 +159,7 @@ sub report {
       my $sess = $day->{$sn};
       my $role = $sess->{role};
       print $DAY[$dn - 1], '-', $sn, ': ',
-       scalar(@$role), '/', $places{$sn}, ' [',
+       scalar(@$role), ' requested/', $places{$sn}, ' available. These kids wanted this slot [',
        join( ', ', map { $_->{kid}{id} } @$role ), "]\n";
     }
   }
